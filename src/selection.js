@@ -62,7 +62,7 @@ class SelectionReader {
     let domSel = this.view.root.getSelection(), doc = this.view.state.doc
     let nearestDesc = this.view.docView.nearestDesc(domSel.focusNode)
     // If the selection is in a non-document part of the view, ignore it
-    if (!nearestDesc.size) {
+    if (!(nearestDesc && nearestDesc.size)) {
       this.storeDOMState()
       return
     }
