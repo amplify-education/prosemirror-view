@@ -1,8 +1,9 @@
 const {Mark} = require("prosemirror-model")
+const {NodeSelection} = require("prosemirror-state")
 
 const {scrollRectIntoView, posAtCoords, coordsAtPos, endOfTextblock, storeScrollPos, resetScrollPos} = require("./domcoords")
 const {docViewDesc} = require("./viewdesc")
-const {initInput, destroyInput, dispatchEvent, startObserving, stopObserving, ensureListeners, flushObserver} = require("./input")
+const {initInput, destroyInput, dispatchEvent, ensureListeners} = require("./input")
 const {SelectionReader, selectionToDOM} = require("./selection")
 const {Decoration, viewDecorations} = require("./decoration")
 
@@ -92,7 +93,7 @@ class EditorView {
     this.state = state
     if (prev.plugins != state.plugins) ensureListeners(this)
 
-    flushObserver(this)
+    this.domObserver.flush()
     if (this.inDOMChange && this.inDOMChange.stateUpdated(state)) return
 
     let prevEditable = this.editable
@@ -106,7 +107,7 @@ class EditorView {
     let oldScrollPos = !scrollToSelection && updateSel && storeScrollPos(this)
 
     if (updateSel) {
-      stopObserving(this)
+      this.domObserver.stop()
       if (updateDoc) {
         if (!this.docView.update(state.doc, outerDeco, innerDeco, this)) {
           this.docView.destroy()
@@ -115,14 +116,14 @@ class EditorView {
         this.selectionReader.clearDOMState()
       }
       selectionToDOM(this)
-      startObserving(this)
+      this.domObserver.start()
     }
 
     if (prevEditable != this.editable) this.selectionReader.editableChanged()
     this.updatePluginViews(prev)
 
     if (scrollToSelection) {
-      if (state.selection.node)
+      if (state.selection instanceof NodeSelection)
         scrollRectIntoView(this, this.docView.domAfterPos(state.selection.from).getBoundingClientRect())
       else
         scrollRectIntoView(this, this.coordsAtPos(state.selection.head))
@@ -155,9 +156,7 @@ class EditorView {
   // :: () → bool
   // Query whether the view has focus.
   hasFocus() {
-    if (this.editable && this.dom.ownerDocument.activeElement != this.dom) return false
-    let sel = this.root.getSelection()
-    return sel.rangeCount && this.dom.contains(sel.anchorNode.nodeType == 3 ? sel.anchorNode.parentNode : sel.anchorNode)
+    return this.root.activeElement == this.dom
   }
 
   // :: (string, (prop: *) → *) → *
@@ -180,9 +179,9 @@ class EditorView {
   // :: ()
   // Focus the editor.
   focus() {
-    stopObserving(this)
+    this.domObserver.stop()
     selectionToDOM(this, true)
-    startObserving(this)
+    this.domObserver.start()
     if (this.editable) this.dom.focus()
   }
 
@@ -230,9 +229,7 @@ class EditorView {
   // Find out whether the selection is at the end of a textblock when
   // moving in a given direction. When, for example, given `"left"`,
   // it will return true if moving left from the current cursor
-  // position would leave that position's parent textblock. For
-  // horizontal motion, it will always return false if the selection
-  // isn't a cursor selection.
+  // position would leave that position's parent textblock.
   endOfTextblock(dir, state) {
     return endOfTextblock(this, state || this.state, dir)
   }
@@ -304,17 +301,18 @@ function cursorWrapperDOM() {
 }
 
 function updateCursorWrapper(view) {
-  let {empty, $head} = view.state.selection
-  if (empty && (view.state.storedMarks ||
-                $head.parent.content.length == 0 ||
-                $head.parentOffset && !$head.textOffset && $head.nodeBefore.marks.some(nonInclusiveMark))) {
+  let {$cursor} = view.state.selection
+  if ($cursor && (view.state.storedMarks ||
+                  $cursor.parent.content.length == 0 ||
+                  $cursor.parentOffset && !$cursor.textOffset && $cursor.nodeBefore.marks.some(nonInclusiveMark))) {
     // Needs a cursor wrapper
-    let marks = view.state.storedMarks || $head.marks()
+    let marks = view.state.storedMarks || $cursor.marks()
     let spec = {isCursorWrapper: true, marks, raw: true}
-    if (!view.cursorWrapper || !Mark.sameSet(view.cursorWrapper.spec.marks, marks))
-      view.cursorWrapper = Decoration.widget($head.pos, cursorWrapperDOM(), spec)
-    else if (view.cursorWrapper.pos != $head.pos)
-      view.cursorWrapper = Decoration.widget($head.pos, view.cursorWrapper.type.widget, spec)
+    if (!view.cursorWrapper || !Mark.sameSet(view.cursorWrapper.spec.marks, marks) ||
+        view.cursorWrapper.type.widget.textContent != "\ufeff")
+      view.cursorWrapper = Decoration.widget($cursor.pos, cursorWrapperDOM(), spec)
+    else if (view.cursorWrapper.pos != $cursor.pos)
+      view.cursorWrapper = Decoration.widget($cursor.pos, view.cursorWrapper.type.widget, spec)
   } else {
     view.cursorWrapper = null
   }
@@ -396,11 +394,25 @@ function getEditable(view) {
 //   handleContextMenu:: ?(view: EditorView, pos: number, event: dom.MouseEvent) → bool
 //   Called when a context menu event is fired in the editor.
 //
+//   handlePaste:: ?(view: EditorView, event: dom.Event, slice: Slice) → bool
+//   Can be used to override the behavior of pasting. `slice` is the
+//   pasted content parsed by the editor, but you can directly access
+//   the event to get at the raw content.
+//
+//   handleDrop:: ?(view: EditorView, event: dom.Event, slice: Slice, moved: bool) → bool
+//   Called when something is dropped on the editor. `moved` will be
+//   true if this drop moves from the current selection (which should
+//   thus be deleted).
+//
 //   onFocus:: ?(view: EditorView, event: dom.Event)
 //   Called when the editor is focused.
 //
 //   onBlur:: ?(view: EditorView, event: dom.Event)
 //   Called when the editor loses focus.
+//
+//   createSelectionBetween:: ?(view: EditorView, anchor: ResolvedPos, head: ResolvedPos) → ?Selection
+//   Can be used to override the selection object created when reading
+//   a DOM selection between the given anchor and head.
 //
 //   domParser:: ?DOMParser
 //   The [parser](#model.DOMParser) to use when reading editor changes

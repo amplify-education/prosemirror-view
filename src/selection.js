@@ -1,7 +1,7 @@
-const {Selection, NodeSelection} = require("prosemirror-state")
+const {TextSelection, NodeSelection} = require("prosemirror-state")
 
 const browser = require("./browser")
-const {flushObserver} = require("./input")
+const {selectionCollapsed} = require("./dom")
 
 // Track the state of the current editor selection. Keeps the editor
 // selection in sync with the DOM selection by polling for changes,
@@ -28,7 +28,7 @@ class SelectionReader {
 
   editableChanged() {
     if (!this.view.editable) this.poller.start()
-    else if (!this.view.hasFocus()) this.poller.stop()
+    else if (!hasFocusAndSelection(this.view)) this.poller.stop()
   }
 
   // : () → bool
@@ -55,8 +55,8 @@ class SelectionReader {
   // When the DOM selection changes in a notable manner, modify the
   // current selection state to match.
   readFromDOM(origin) {
-    if (this.ignoreUpdates || !this.domChanged() || !this.view.hasFocus()) return
-    if (!this.view.inDOMChange) flushObserver(this.view)
+    if (this.ignoreUpdates || !this.domChanged() || !hasFocusAndSelection(this.view)) return
+    if (!this.view.inDOMChange) this.view.domObserver.flush()
     if (this.view.inDOMChange) return
 
     let domSel = this.view.root.getSelection(), doc = this.view.state.doc
@@ -68,11 +68,11 @@ class SelectionReader {
     }
     let head = this.view.docView.posFromDOM(domSel.focusNode, domSel.focusOffset)
     let $head = doc.resolve(head), $anchor, selection
-    if (domSel.isCollapsed) {
+    if (selectionCollapsed(domSel)) {
       $anchor = $head
       while (nearestDesc && !nearestDesc.node) nearestDesc = nearestDesc.parent
-      if (nearestDesc && nearestDesc.node.isAtom && NodeSelection.isSelectable(nearestDesc.node)) {
-        let pos = nearestDesc.posAtStart
+      if (nearestDesc && nearestDesc.node.isAtom && NodeSelection.isSelectable(nearestDesc.node) && nearestDesc.parent) {
+        let pos = nearestDesc.posBefore
         selection = new NodeSelection(head == pos ? $head : doc.resolve(pos))
       }
     } else {
@@ -80,11 +80,10 @@ class SelectionReader {
     }
 
     if (!selection) {
-      let bias = origin == "pointer" ||
-          (this.view.state.selection.head != null && this.view.state.selection.head < $head.pos) ? 1 : -1
-      selection = Selection.between($anchor, $head, bias)
+      let bias = origin == "pointer" || this.view.state.selection.head < $head.pos ? 1 : -1
+      selection = selectionBetween(this.view, $anchor, $head, bias)
     }
-    if ($head.pos == selection.head && $anchor.pos == selection.anchor)
+    if (head == selection.head && $anchor.pos == selection.anchor)
       this.storeDOMState(selection)
     if (!this.view.state.selection.eq(selection)) {
       let tr = this.view.state.tr.setSelection(selection)
@@ -117,7 +116,7 @@ class SelectionChangePoller {
     if (!this.listening) {
       document.addEventListener("selectionchange", this.readFunc)
       this.listening = true
-      if (this.reader.view.hasFocus()) this.readFunc()
+      if (hasFocusAndSelection(this.reader.view)) this.readFunc()
     }
   }
 
@@ -174,7 +173,11 @@ function selectionToDOM(view, takeFocus) {
   if (!view.hasFocus()) {
     if (!takeFocus) return
     // See https://bugzilla.mozilla.org/show_bug.cgi?id=921444
-    else if (browser.gecko && view.editable) view.dom.focus()
+    if (browser.gecko && view.editable) {
+      view.selectionReader.ignoreUpdates = true
+      view.dom.focus()
+      view.selectionReader.ignoreUpdates = false
+    }
   }
 
   let reader = view.selectionReader
@@ -185,21 +188,19 @@ function selectionToDOM(view, takeFocus) {
   if (view.cursorWrapper) {
     selectCursorWrapper(view)
   } else {
-    let {anchor, head} = sel, resetEditable
-    if (anchor == null) {
-      anchor = sel.from
-      head = sel.to
-      if (browser.webkit && sel.node.isBlock) {
-        let desc = view.docView.descAt(sel.from)
-        if (!desc.contentDOM && desc.dom.contentEditable == "false") {
-          resetEditable = desc.dom
-          desc.dom.contentEditable = "true"
-        }
-      }
+    let {anchor, head} = sel, resetEditableFrom, resetEditableTo
+    if (browser.webkit && !(sel instanceof TextSelection)) {
+      if (!sel.$from.parent.inlineContent)
+        resetEditableFrom = temporarilyEditableNear(view, sel.from)
+      if (!sel.empty && !sel.$from.parent.inlineContent)
+        resetEditableTo = temporarilyEditableNear(view, sel.to)
     }
     view.docView.setSelection(anchor, head, view.root)
-    if (resetEditable) resetEditable.contentEditable = "false"
-    if (!sel.node) {
+    if (browser.webkit) {
+      if (resetEditableFrom) resetEditableFrom.contentEditable = "false"
+      if (resetEditableTo) resetEditableTo.contentEditable = "false"
+    }
+    if (sel.visible) {
       view.dom.classList.remove("ProseMirror-hideselection")
     } else {
       view.dom.classList.add("ProseMirror-hideselection")
@@ -211,6 +212,24 @@ function selectionToDOM(view, takeFocus) {
   reader.ignoreUpdates = false
 }
 exports.selectionToDOM = selectionToDOM
+
+// Kludge to work around Webkit not allowing a selection to start/end
+// between non-editable block nodes. We briefly make something
+// editable, set the selection, then set it uneditable again.
+function temporarilyEditableNear(view, pos) {
+  let {node, offset} = view.docView.domFromPos(pos)
+  let after = offset < node.childNodes.length ? node.childNodes[offset] : null
+  let before = offset ? node.childNodes[offset - 1] : null
+  if ((!after || after.contentEditable == "false") && (!before || before.contentEditable == "false")) {
+    if (after) {
+      after.contentEditable = "true"
+      return after
+    } else if (before) {
+      before.contentEditable = "true"
+      return before
+    }
+  }
+}
 
 function removeClassOnSelectionChange(view) {
   document.removeEventListener("selectionchange", view.hideSelectionGuard)
@@ -252,4 +271,16 @@ function clearNodeSelection(view) {
     view.lastSelectedViewDesc.deselectNode()
     view.lastSelectedViewDesc = null
   }
+}
+
+function selectionBetween(view, $anchor, $head, bias) {
+  return view.someProp("createSelectionBetween", f => f(view, $anchor, $head))
+    || TextSelection.between($anchor, $head, bias)
+}
+exports.selectionBetween = selectionBetween
+
+function hasFocusAndSelection(view) {
+  if (view.editable && view.root.activeElement != view.dom) return false
+  let sel = view.root.getSelection()
+  return sel.anchorNode && view.dom.contains(sel.anchorNode.nodeType == 3 ? sel.anchorNode.parentNode : sel.anchorNode)
 }

@@ -3,9 +3,9 @@ const browser = require("./browser")
 const {domIndex} = require("./dom")
 
 function moveSelectionBlock(state, dir) {
-  let {$from, $to, node} = state.selection
-  let $side = dir > 0 ? $to : $from
-  let $start = node && node.isBlock ? $side : $side.depth ? state.doc.resolve(dir > 0 ? $side.after() : $side.before()) : null
+  let {$anchor, $head} = state.selection
+  let $side = dir > 0 ? $anchor.max($head) : $anchor.min($head)
+  let $start = !$side.parent.inlineContent ? $side : $side.depth ? state.doc.resolve(dir > 0 ? $side.after() : $side.before()) : null
   return $start && Selection.findFrom($start, dir)
 }
 
@@ -15,26 +15,27 @@ function apply(view, sel) {
 }
 
 function selectHorizontally(view, dir) {
-  let {empty, node, $from, $to} = view.state.selection
-  if (!empty && !node) return false
-
-  if (node && node.isInline)
-    return apply(view, new TextSelection(dir > 0 ? $to : $from))
-
-  if (!node && !view.endOfTextblock(dir > 0 ? "right" : "left")) {
-    let {node: nextNode, offset} = dir > 0
-        ? $from.parent.childAfter($from.parentOffset)
-        : $from.parent.childBefore($from.parentOffset)
-    if (nextNode && NodeSelection.isSelectable(nextNode) && offset == $from.parentOffset - (dir > 0 ? 0 : nextNode.nodeSize))
-      return apply(view, new NodeSelection(dir < 0 ? view.state.doc.resolve($from.pos - nextNode.nodeSize) : $from))
+  let sel = view.state.selection
+  if (sel instanceof TextSelection) {
+    if (!sel.empty) {
+      return false
+    } else if (view.endOfTextblock(dir > 0 ? "right" : "left")) {
+      let next = moveSelectionBlock(view.state, dir)
+      if (next && (next instanceof NodeSelection)) return apply(view, next)
+      return false
+    } else {
+      let $head = sel.$head, node = $head.textOffset ? null : dir < 0 ? $head.nodeBefore : $head.nodeAfter
+      if (node && NodeSelection.isSelectable(node))
+        return apply(view, new NodeSelection(dir < 0 ? view.state.doc.resolve($head.pos - node.nodeSize) : $head))
+      return false
+    }
+  } else if (sel instanceof NodeSelection && sel.node.isInline) {
+    return apply(view, new TextSelection(dir > 0 ? sel.$to : sel.$from))
+  } else {
+    let next = moveSelectionBlock(view.state, dir)
+    if (next) return apply(view, next)
     return false
   }
-
-  let next = moveSelectionBlock(view.state, dir)
-  if (next && (next instanceof NodeSelection || node))
-    return apply(view, next)
-
-  return false
 }
 
 function nodeLen(node) {
@@ -52,19 +53,23 @@ function skipIgnoredNodesLeft(view) {
   let sel = view.root.getSelection()
   let node = sel.anchorNode, offset = sel.anchorOffset
   let moveNode, moveOffset
-  if (node.nodeType == 3 && offset && node.nodeValue.charAt(offset - 1) == "\ufeff") {
-    moveNode = node
-    moveOffset = --offset
-  }
   for (;;) {
     if (offset > 0) {
-      if (node.nodeType != 1) break
-      let before = node.childNodes[offset - 1]
-      if (isIgnorable(before)) {
-        moveNode = node
-        moveOffset = --offset
+      if (node.nodeType != 1) {
+        if (node.nodeType == 3 && node.nodeValue.charAt(offset - 1) == "\ufeff") {
+          moveNode = node
+          moveOffset = --offset
+        } else break
+      } else {
+        let before = node.childNodes[offset - 1]
+        if (isIgnorable(before)) {
+          moveNode = node
+          moveOffset = --offset
+        } else if (before.nodeType == 3) {
+          node = before
+          offset = node.nodeValue.length
+        } else break
       }
-      else break
     } else if (isBlockNode(node)) {
       break
     } else {
@@ -143,28 +148,26 @@ function setSel(sel, node, offset) {
 // selections. If so, apply it (if not, the result is left to the
 // browser)
 function selectVertically(view, dir) {
-  let {empty, node, $from, $to} = view.state.selection
-  if (!empty && !node) return false
+  let sel = view.state.selection
+  if (sel instanceof TextSelection && !sel.empty) return false
+  let {$from, $to} = sel
 
-  let leavingTextblock = true, $start = dir < 0 ? $from : $to
-  if (!node || node.isInline)
-    leavingTextblock = view.endOfTextblock(dir < 0 ? "up" : "down")
-
-  if (leavingTextblock) {
+  if (!$from.parent.inlineContent || view.endOfTextblock(dir < 0 ? "up" : "down")) {
     let next = moveSelectionBlock(view.state, dir)
     if (next && (next instanceof NodeSelection))
       return apply(view, next)
   }
-
-  if (!node || node.isInline) return false
-
-  let beyond = Selection.findFrom($start, dir)
-  return beyond ? apply(view, beyond) : true
+  if (!$from.parent.inlineContent) {
+    let beyond = Selection.findFrom(dir < 0 ? $from : $to, dir)
+    return beyond ? apply(view, beyond) : true
+  }
+  return false
 }
 
 function stopNativeHorizontalDelete(view, dir) {
+  if (!(view.state.selection instanceof TextSelection)) return true
   let {$head, $anchor, empty} = view.state.selection
-  if (!$head || !$head.sameParent($anchor)) return true
+  if (!$head.sameParent($anchor)) return true
   if (!empty) return false
   if (view.endOfTextblock(dir > 0 ? "forward" : "backward")) return true
   let nextNode = !$head.textOffset && (dir < 0 ? $head.nodeBefore : $head.nodeAfter)
@@ -196,9 +199,9 @@ function getMods(event) {
 
 function captureKeyDown(view, event) {
   let code = event.keyCode, mods = getMods(event)
-  if (code == 8) { // Backspace
+  if (code == 8 || (browser.mac && code == 72 && mods == "c")) { // Backspace, Ctrl-h on Mac
     return stopNativeHorizontalDelete(view, -1) || skipIgnoredNodesLeft(view)
-  } else if (code == 46) { // Delete
+  } else if (code == 46 || (browser.mac && code == 68 && mods == "c")) { // Delete, Ctrl-d on Mac
     return stopNativeHorizontalDelete(view, 1) || skipIgnoredNodesRight(view)
   } else if (code == 13 || code == 27) { // Enter, Esc
     return true
@@ -213,10 +216,6 @@ function captureKeyDown(view, event) {
   } else if (mods == (browser.mac ? "m" : "c") &&
              (code == 66 || code == 73 || code == 89 || code == 90)) { // Mod-[biyz]
     return true
-  } else if (browser.mac && // Ctrl-[dh] and Alt-d on Mac
-             ((code == 68 || code == 72) && mods == "c") ||
-              (code == 68 && mods == "a")) {
-    return stopNativeHorizontalDelete(view, code == 68 ? 1 : -1) || skipIgnoredNodesRight(view)
   }
   return false
 }

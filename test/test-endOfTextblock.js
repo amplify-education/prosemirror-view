@@ -1,4 +1,4 @@
-const {schema, doc, p} = require("prosemirror-model/test/build")
+const {schema, doc, p} = require("prosemirror-test-builder")
 const ist = require("ist")
 const {tempEditor} = require("./view")
 const {Decoration, DecorationSet} = require("../dist")
@@ -96,7 +96,6 @@ describe("EditorView.endOfTextblock", () => {
     let view = tempEditor({doc: doc(p("proseمرآة<a>"))})
     ist(!view.endOfTextblock("left"))
     ist(!view.endOfTextblock("backward"))
-    ist(view.endOfTextblock("right"))
     ist(view.endOfTextblock("forward"))
   })
 

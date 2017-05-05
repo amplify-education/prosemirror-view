@@ -1,5 +1,5 @@
 const ist = require("ist")
-const {schema, doc, p, blockquote} = require("prosemirror-model/test/build")
+const {schema, doc, p, blockquote} = require("prosemirror-test-builder")
 const {Transform} = require("prosemirror-transform")
 
 const {Decoration, DecorationSet, removeOverlap} = require("../dist/decoration")
@@ -141,13 +141,13 @@ describe("DecorationSet", () => {
     })
 
     it("understands unclusiveLeft", () => {
-      let {set} = buildMap(doc(p("foo")), {from: 2, to: 3, inclusiveLeft: true},
+      let {set} = buildMap(doc(p("foo")), {from: 2, to: 3, inclusiveStart: true},
                            tr => tr.replaceWith(2, 2, schema.text(".")).replaceWith(4, 4, schema.text("?")))
       ist(str(set), "[0: [1-3]]")
     })
 
     it("understands unclusiveRight", () => {
-      let {set} = buildMap(doc(p("foo")), {from: 2, to: 3, inclusiveRight: true},
+      let {set} = buildMap(doc(p("foo")), {from: 2, to: 3, inclusiveEnd: true},
                            tr => tr.replaceWith(2, 2, schema.text(".")).replaceWith(4, 4, schema.text("?")))
       ist(str(set), "[0: [2-4]]")
     })
@@ -192,9 +192,9 @@ describe("DecorationSet", () => {
       ist(JSON.stringify(dropped2.sort()), '["a","b"]')
     })
 
-    it("respects the associative option on widgets", () => {
+    it("respects the side option on widgets", () => {
       let d = doc(p("foo"))
-      let set = build(d, {pos: 3, associative: "left", name: "a"}, {pos: 3, name: "b"})
+      let set = build(d, {pos: 3, side: -1, name: "a"}, {pos: 3, name: "b"})
       let tr = new Transform(d).replaceWith(3, 3, schema.text("ay"))
       let result = set.map(tr.mapping, tr.doc).find().map(d => d.from + "-" + d.spec.name).sort().join(", ")
       ist(result, "3-a, 5-b")

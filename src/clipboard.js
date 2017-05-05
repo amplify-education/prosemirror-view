@@ -1,61 +1,37 @@
 const {Slice, Fragment, DOMParser, DOMSerializer} = require("prosemirror-model")
 
-// : (EditorView, Selection, dom.DataTransfer) → Slice
-// Store the content of a selection in the clipboard (or whatever the
-// given data transfer refers to)
-function toClipboard(view, range, dataTransfer) {
-  // Node selections are copied using just the node, text selection include parents
-  let doc = view.state.doc, fullSlice = doc.slice(range.from, range.to, !range.node)
-  let slice = fullSlice, context
-  if (!range.node) {
-    // Shrink slices for non-node selections to hold only the parent
-    // node, store rest in context string, so that other tools don't
-    // get confused
-    let cut = Math.max(0, range.$from.sharedDepth(range.to) - 1)
-    context = sliceContext(slice, cut)
-    let content = slice.content
-    for (let i = 0; i < cut; i++) content = content.firstChild.content
-    slice = new Slice(content, slice.openLeft - cut, slice.openRight - cut)
+function serializeForClipboard(view, slice) {
+  let context = [], {content, openStart, openEnd} = slice
+  while (openStart > 1 && openEnd > 1 && content.childCount == 1 && content.firstChild.childCount == 1) {
+    openStart--
+    openEnd--
+    let node = content.firstChild
+    context.push(node.type.name, node.type.hasRequiredAttrs() ? node.attrs : null)
+    content = node.content
   }
 
   let serializer = view.someProp("clipboardSerializer") || DOMSerializer.fromSchema(view.state.schema)
-  let dom = serializer.serializeFragment(slice.content), wrap = document.createElement("div")
-  wrap.appendChild(dom)
+  let wrap = document.createElement("div")
+  wrap.appendChild(serializer.serializeFragment(content))
   let child = wrap.firstChild.nodeType == 1 && wrap.firstChild
   if (child) {
-    if (range.node)
-      child.setAttribute("data-pm-node-selection", true)
-    else
-      child.setAttribute("data-pm-context", context)
+    let singleNode = slice.openStart == 0 && slice.openEnd == 0 && slice.content.childCount == 1 && !slice.content.firstChild.isText
+    child.setAttribute("data-pm-context", singleNode ? "none" : JSON.stringify(context))
   }
-
-  dataTransfer.clearData()
-  dataTransfer.setData("text/html", wrap.innerHTML)
-  dataTransfer.setData("text/plain", slice.content.textBetween(0, slice.content.size, "\n\n"))
-  return fullSlice
+  return wrap
 }
-exports.toClipboard = toClipboard
+exports.serializeForClipboard = serializeForClipboard
 
-let cachedCanUpdateClipboard = null
-function canUpdateClipboard(dataTransfer) {
-  if (cachedCanUpdateClipboard != null) return cachedCanUpdateClipboard
-  dataTransfer.setData("text/html", "<hr>")
-  return cachedCanUpdateClipboard = dataTransfer.getData("text/html") == "<hr>"
-}
-exports.canUpdateClipboard = canUpdateClipboard
-
-// : (EditorView, dom.DataTransfer, ?bool, ResolvedPos) → ?Slice
+// : (EditorView, string, string, ?bool, ResolvedPos) → ?Slice
 // Read a slice of content from the clipboard (or drop data).
-function fromClipboard(view, dataTransfer, plainText, $context) {
-  let txt = dataTransfer.getData("text/plain")
-  let html = dataTransfer.getData("text/html")
-  if (!html && !txt) return null
+function parseFromClipboard(view, text, html, plainText, $context) {
   let dom, inCode = $context.parent.type.spec.code
-  if ((plainText || inCode || !html) && txt) {
-    view.someProp("transformPastedText", f => txt = f(txt))
-    if (inCode) return new Slice(Fragment.from(view.state.schema.text(txt)), 0, 0)
+  if (!html && !text) return null
+  if ((plainText || inCode || !html) && text) {
+    view.someProp("transformPastedText", f => text = f(text))
+    if (inCode) return new Slice(Fragment.from(view.state.schema.text(text)), 0, 0)
     dom = document.createElement("div")
-    txt.split(/(?:\r\n?|\n)+/).forEach(block => {
+    text.trim().split(/(?:\r\n?|\n)+/).forEach(block => {
       dom.appendChild(document.createElement("p")).textContent = block
     })
   } else {
@@ -64,16 +40,19 @@ function fromClipboard(view, dataTransfer, plainText, $context) {
   }
 
   let parser = view.someProp("clipboardParser") || view.someProp("domParser") || DOMParser.fromSchema(view.state.schema)
-  let slice = parser.parseSlice(dom, {preserveWhitespace: true, context: $context}), context
-  if (dom.querySelector("[data-pm-node-selection]"))
+  let slice = parser.parseSlice(dom, {preserveWhitespace: true, context: $context})
+  slice = closeIsolatingStart(slice)
+  let contextNode = dom.querySelector("[data-pm-context]"), context = contextNode && contextNode.getAttribute("data-pm-context")
+  if (context == "none")
     slice = new Slice(slice.content, 0, 0)
-  else if (context = dom.querySelector("[data-pm-context]"))
-    slice = addContext(slice, context.getAttribute("data-pm-context"))
+  else if (context)
+    slice = addContext(slice, context)
   else // HTML wasn't created by ProseMirror. Make sure top-level siblings are coherent
     slice = normalizeSiblings(slice, $context)
+  view.someProp("transformPasted", f => { slice = f(slice) })
   return slice
 }
-exports.fromClipboard = fromClipboard
+exports.parseFromClipboard = parseFromClipboard
 
 // Takes a slice parsed with parseSlice, which means there hasn't been
 // any content-expression checking done on the top nodes, tries to
@@ -155,27 +134,37 @@ function readHTML(html) {
   return elt
 }
 
-function sliceContext(slice, depth) {
-  let result = [], content = slice.content
-  for (let i = 0; i < depth; i++) {
-    let node = content.firstChild
-    result.push(node.type.name, node.type.hasRequiredAttrs() ? node.attrs : null)
-    content = node.content
-  }
-  return JSON.stringify(result)
-}
-
 function addContext(slice, context) {
   if (!slice.size) return slice
   let schema = slice.content.firstChild.type.schema, array
   try { array = JSON.parse(context) }
   catch(e) { return slice }
-  let {content, openLeft, openRight} = slice
+  let {content, openStart, openEnd} = slice
   for (let i = array.length - 2; i >= 0; i -= 2) {
     let type = schema.nodes[array[i]]
     if (!type || type.hasRequiredAttrs()) break
     content = Fragment.from(type.create(array[i + 1], content))
-    openLeft++; openRight++
+    openStart++; openEnd++
   }
-  return new Slice(content, openLeft, openRight)
+  return new Slice(content, openStart, openEnd)
+}
+
+function closeIsolatingStart(slice) {
+  let closeTo = 0, frag = slice.content
+  for (let i = 1; i <= slice.openStart; i++) {
+    let node = frag.firstChild
+    if (node.type.spec.isolating) { closeTo = i; break }
+    frag = node.content
+  }
+
+  if (closeTo == 0) return slice
+  return new Slice(closeFragment(slice.content, closeTo, slice.openEnd), slice.openStart - closeTo, slice.openEnd)
+}
+
+function closeFragment(frag, n, openEnd) {
+  if (n == 0) return frag
+  let node = frag.firstChild
+  let content = closeFragment(node.content, n - 1, openEnd - 1)
+  let fill = node.contentMatchAt(0).fillBefore(node.content, openEnd <= 0)
+  return frag.replaceChild(0, node.copy(fill.append(content)))
 }

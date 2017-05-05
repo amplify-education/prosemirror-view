@@ -1,3 +1,5 @@
+const browser = require("./browser")
+
 const domIndex = exports.domIndex = function(node) {
   for (var index = 0;; index++) {
     node = node.previousSibling
@@ -25,12 +27,14 @@ exports.isEquivalentPosition = function(node, off, targetNode, targetOff) {
                         scanFor(node, off, targetNode, targetOff, 1))
 }
 
+const atomElements = /^(img|br|input|textarea|hr)$/i
+
 function scanFor(node, off, targetNode, targetOff, dir) {
   for (;;) {
     if (node == targetNode && off == targetOff) return true
     if (off == (dir < 0 ? 0 : nodeSize(node))) {
       let parent = node.parentNode
-      if (parent.nodeType != 1 || hasBlockDesc(parent)) return false
+      if (parent.nodeType != 1 || hasBlockDesc(node) || atomElements.test(node.nodeName)) return false
       off = domIndex(node) + (dir < 0 ? 0 : 1)
       node = parent
     } else if (node.nodeType == 1) {
@@ -49,4 +53,13 @@ function nodeSize(node) {
 function hasBlockDesc(dom) {
   let desc = dom.pmViewDesc
   return desc && desc.node && desc.node.isBlock
+}
+
+// Work around Chrome issue https://bugs.chromium.org/p/chromium/issues/detail?id=447523
+// (isCollapsed inappropriately returns true in shadow dom)
+exports.selectionCollapsed = function(domSel) {
+  let collapsed = domSel.isCollapsed
+  if (collapsed && browser.chrome && domSel.rangeCount && !domSel.getRangeAt(0).collapsed)
+    collapsed = false
+  return collapsed
 }

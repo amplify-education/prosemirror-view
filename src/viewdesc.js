@@ -102,6 +102,8 @@ class ViewDesc {
   matchesNode() { return false }
   matchesHack() { return false }
 
+  get beforePosition() { return false }
+
   // : () → ?ParseRule
   // When parsing in-editor content (in domchange.js), we allow
   // descriptions to determine the parse rules that should be used to
@@ -241,41 +243,70 @@ class ViewDesc {
     }
   }
 
-  // : (number, ?bool) → {node: dom.Node, offset: number}
-  domFromPos(pos, searchDOM) {
+  // : (number) → {node: dom.Node, offset: number}
+  domFromPos(pos) {
     if (!this.contentDOM) return {node: this.dom, offset: 0}
     for (let offset = 0, i = 0;; i++) {
-      if (offset == pos)
-        return {node: this.contentDOM,
-                offset: searchDOM ? this.findDOMOffset(i, searchDOM) : i}
+      if (offset == pos) {
+        while (i < this.children.length && this.children[i].beforePosition) i++
+        return {node: this.contentDOM, offset: i}
+      }
       if (i == this.children.length) throw new Error("Invalid position " + pos)
       let child = this.children[i], end = offset + child.size
-      if (pos < end) return child.domFromPos(pos - offset - child.border, searchDOM)
+      if (pos < end) return child.domFromPos(pos - offset - child.border)
       offset = end
     }
   }
 
-  // If the DOM was directly edited, we can't trust the child view
-  // desc offsets anymore, so we search the actual DOM to figure out
-  // the offset that corresponds to a given child.
-  findDOMOffset(i, searchDOM) {
-    if (searchDOM < 0) {
-      for (let j = i - 1; j >= 0; j--) {
-        let child = this.children[j]
-        if (!child.size) continue
-        let found = domIndex(child.dom)
-        if (found > -1) return found + 1
+  // Used to find a DOM range in a single parent for a given changed
+  // range.
+  parseRange(from, to, base = 0) {
+    if (this.children.length == 0)
+      return {node: this.contentDOM, from, to, fromOffset: 0, toOffset: this.contentDOM.childNodes.length}
+
+    let fromOffset = -1, toOffset = -1
+    for (let offset = 0, i = 0;; i++) {
+      let child = this.children[i], end = offset + child.size
+      if (fromOffset == -1 && from <= end) {
+        let childBase = offset + child.border
+        // FIXME maybe descend mark views to parse a narrower range?
+        if (from >= childBase && to <= end - child.border && child.node &&
+            child.contentDOM && this.contentDOM.contains(child.contentDOM))
+          return child.parseRange(from - childBase, to - childBase, base + childBase)
+
+        from = base + offset
+        for (let j = i; j > 0; j--) {
+          let prev = this.children[j - 1]
+          if (prev.size && prev.dom.parentNode == this.contentDOM && !prev.emptyChildAt(1)) {
+            fromOffset = domIndex(prev.dom) + 1
+            break
+          }
+          from -= prev.size
+        }
+        if (fromOffset == -1) fromOffset = 0
       }
-      return 0
-    } else {
-      for (let j = i; j < this.children.length; j++) {
-        let child = this.children[j]
-        if (!child.size) continue
-        let found = domIndex(child.dom)
-        if (found > -1) return found
+      if (fromOffset > -1 && to <= end) {
+        to = base + end
+        for (let j = i + 1; j < this.children.length; j++) {
+          let next = this.children[j]
+          if (next.size && next.dom.parentNode == this.contentDOM && !next.emptyChildAt(-1)) {
+            toOffset = domIndex(next.dom)
+            break
+          }
+          to += next.size
+        }
+        if (toOffset == -1) toOffset = this.contentDOM.childNodes.length
+        break
       }
-      return this.contentDOM.childNodes.length
+      offset = end
     }
+    return {node: this.contentDOM, from, to, fromOffset, toOffset}
+  }
+
+  emptyChildAt(side) {
+    if (this.border || !this.contentDOM || !this.children.length) return false
+    let child = this.children[side < 0 ? 0 : this.children.length - 1]
+    return child.size == 0 || child.emptyChildAt(side)
   }
 
   // : (number) → dom.Node
@@ -369,6 +400,10 @@ class WidgetViewDesc extends ViewDesc {
     this.widget = widget
   }
 
+  get beforePosition() {
+    return this.widget.type.side < 0
+  }
+
   matchesWidget(widget) {
     return this.dirty == NOT_DIRTY && widget.type.eq(this.widget.type)
   }
@@ -389,11 +424,15 @@ class CursorWrapperDesc extends WidgetViewDesc {
   parseRule() {
     let content
     for (let child = this.dom.firstChild; child; child = child.nextSibling) {
-      let add = child
+      let add
       if (child.nodeType == 3) {
         let text = child.nodeValue.replace(/\ufeff/g, "")
         if (!text) continue
         add = document.createTextNode(text)
+      } else if (child.textContent == "\ufeff") {
+        continue
+      } else {
+        add = child.cloneNode(true)
       }
       if (!content) content = document.createDocumentFragment()
       content.appendChild(add)
@@ -605,7 +644,8 @@ class TextViewDesc extends NodeViewDesc {
   }
 
   parseRule() {
-    return {skip: this.nodeDOM.parentNode}
+    let parent = this.nodeDOM.parentNode
+    return parent ? {skip: parent} : {ignore: true}
   }
 
   update(node, outerDeco) {
@@ -625,8 +665,8 @@ class TextViewDesc extends NodeViewDesc {
     return false
   }
 
-  domFromPos(pos, searchDOM) {
-    return {node: this.nodeDOM, offset: searchDOM ? Math.max(pos, this.nodeDOM.nodeValue.length) : pos}
+  domFromPos(pos) {
+    return {node: this.nodeDOM, offset: pos}
   }
 
   localPosFromDOM(dom, offset, bias) {
@@ -712,16 +752,17 @@ function renderDescs(parentDOM, descs) {
     } else {
       parentDOM.insertBefore(childDOM, dom)
     }
-    if (desc instanceof MarkViewDesc)
+    if (desc instanceof MarkViewDesc) {
+      let pos = dom ? dom.previousSibling : parentDOM.lastChild
       renderDescs(desc.contentDOM, desc.children)
+      dom = pos ? pos.nextSibling : parentDOM.firstChild
+    }
   }
   while (dom) dom = rm(dom)
 }
 
-class OuterDecoLevel {
-  constructor(nodeName) {
-    if (nodeName) this.nodeName = nodeName
-  }
+function OuterDecoLevel(nodeName) {
+  if (nodeName) this.nodeName = nodeName
 }
 OuterDecoLevel.prototype = Object.create(null)
 
@@ -970,8 +1011,17 @@ function iterDeco(parent, deco, onWidget, onNode) {
 
   let decoIndex = 0, active = [], restNode = null
   for (let parentIndex = 0;;) {
-    while (decoIndex < locals.length && locals[decoIndex].to == offset)
-      onWidget(locals[decoIndex++])
+    if (decoIndex < locals.length && locals[decoIndex].to == offset) {
+      let widget = locals[decoIndex++], widgets
+      while (decoIndex < locals.length && locals[decoIndex].to == offset)
+        (widgets || (widgets = [widget])).push(locals[decoIndex++])
+      if (widgets) {
+        widgets.sort((a, b) => a.type.side - b.type.side)
+        widgets.forEach(onWidget)
+      } else {
+        onWidget(widget)
+      }
+    }
 
     let child
     if (restNode) {

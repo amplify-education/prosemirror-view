@@ -1,4 +1,4 @@
-const {doc, p, hr, em, blockquote} = require("prosemirror-model/test/build")
+const {doc, p, hr, em, blockquote} = require("prosemirror-test-builder")
 const {Plugin} = require("prosemirror-state")
 const {tempEditor} = require("./view")
 const {DecorationSet, Decoration} = require("../dist")
@@ -84,6 +84,14 @@ describe("Decoration drawing", () => {
     ist(found[0].nextSibling.textContent, "foo")
     ist(found[1].nextSibling.textContent, "bar")
     ist(found[2].previousSibling.textContent, "bar")
+  })
+
+  it("orders widgets by their side option", () => {
+    let view = tempEditor({doc: doc(p("foobar")),
+                           plugins: [decoPlugin([Decoration.widget(4, document.createTextNode("B")),
+                                                 Decoration.widget(4, document.createTextNode("A"), {side: -100}),
+                                                 Decoration.widget(4, document.createTextNode("C"), {side: 2})])]})
+    ist(view.dom.textContent, "fooABCbar")
   })
 
   it("draws a widget in an empty node", () => {
