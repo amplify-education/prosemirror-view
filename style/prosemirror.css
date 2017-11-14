@@ -5,10 +5,8 @@
 .ProseMirror {
   word-wrap: break-word;
   white-space: pre-wrap;
-}
-
-.ProseMirror ul, .ProseMirror ol {
-  cursor: default;
+  -webkit-font-variant-ligatures: none;
+  font-variant-ligatures: none;
 }
 
 .ProseMirror pre {
@@ -17,10 +15,6 @@
 
 .ProseMirror li {
   position: relative;
-  pointer-events: none; /* Don't do weird stuff with marker clicks */
-}
-.ProseMirror li > * {
-  pointer-events: auto;
 }
 
 .ProseMirror-hideselection *::selection { background: transparent; }

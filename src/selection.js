@@ -1,12 +1,12 @@
-const {TextSelection, NodeSelection} = require("prosemirror-state")
+import {TextSelection, NodeSelection} from "prosemirror-state"
 
-const browser = require("./browser")
-const {selectionCollapsed} = require("./dom")
+import browser from "./browser"
+import {selectionCollapsed} from "./dom"
 
 // Track the state of the current editor selection. Keeps the editor
 // selection in sync with the DOM selection by polling for changes,
 // as there is no DOM event for DOM selection changes.
-class SelectionReader {
+export class SelectionReader {
   constructor(view) {
     this.view = view
 
@@ -16,10 +16,10 @@ class SelectionReader {
     this.ignoreUpdates = false
     this.poller = poller(this)
 
-    view.dom.addEventListener("focus", () => this.poller.start())
+    view.dom.addEventListener("focus", () => this.poller.start(hasFocusAndSelection(this.view)))
     view.dom.addEventListener("blur", () => this.poller.stop())
 
-    if (!view.editable) this.poller.start()
+    if (!view.editable) this.poller.start(false)
   }
 
   destroy() { this.poller.stop() }
@@ -60,12 +60,7 @@ class SelectionReader {
     if (this.view.inDOMChange) return
 
     let domSel = this.view.root.getSelection(), doc = this.view.state.doc
-    let nearestDesc = this.view.docView.nearestDesc(domSel.focusNode)
-    // If the selection is in a non-document part of the view, ignore it
-    if (!(nearestDesc && nearestDesc.size)) {
-      this.storeDOMState()
-      return
-    }
+    let nearestDesc = this.view.docView.nearestDesc(domSel.focusNode), inWidget = nearestDesc.size == 0
     let head = this.view.docView.posFromDOM(domSel.focusNode, domSel.focusOffset)
     let $head = doc.resolve(head), $anchor, selection
     if (selectionCollapsed(domSel)) {
@@ -80,22 +75,23 @@ class SelectionReader {
     }
 
     if (!selection) {
-      let bias = origin == "pointer" || this.view.state.selection.head < $head.pos ? 1 : -1
+      let bias = origin == "pointer" || (this.view.state.selection.head < $head.pos && !inWidget) ? 1 : -1
       selection = selectionBetween(this.view, $anchor, $head, bias)
     }
-    if (head == selection.head && $anchor.pos == selection.anchor)
-      this.storeDOMState(selection)
+    let preserve = !inWidget && !this.view.cursorWrapper && head == selection.head && $anchor.pos == selection.anchor
+    if (preserve) this.storeDOMState(selection)
     if (!this.view.state.selection.eq(selection)) {
       let tr = this.view.state.tr.setSelection(selection)
       if (origin == "pointer") tr.setMeta("pointer", true)
       this.view.dispatch(tr)
+    } else if (!preserve) {
+      selectionToDOM(this.view)
     }
   }
 }
-exports.SelectionReader = SelectionReader
 
 // There's two polling models. On browsers that support the
-// selectionchange event (everything except Firefox, basically), we
+// selectionchange event (everything except Firefox < 52, basically), we
 // register a listener for that whenever the editor is focused.
 class SelectionChangePoller {
   constructor(reader) {
@@ -112,23 +108,26 @@ class SelectionChangePoller {
     this.originTime = Date.now()
   }
 
-  start() {
+  start(andRead) {
     if (!this.listening) {
-      document.addEventListener("selectionchange", this.readFunc)
+      let doc = this.reader.view.dom.ownerDocument
+      doc.addEventListener("selectionchange", this.readFunc)
       this.listening = true
-      if (hasFocusAndSelection(this.reader.view)) this.readFunc()
+      if (andRead) this.readFunc()
     }
   }
 
   stop() {
     if (this.listening) {
-      document.removeEventListener("selectionchange", this.readFunc)
+      let doc = this.reader.view.dom.ownerDocument
+      doc.removeEventListener("selectionchange", this.readFunc)
       this.listening = false
     }
   }
 }
 
-// On Firefox, we use timeout-based polling.
+// On Browsers that don't support the selectionchange event,
+// we use timeout-based polling.
 class TimeoutPoller {
   constructor(reader) {
     // The timeout ID for the poller when active.
@@ -166,7 +165,7 @@ function poller(reader) {
   return new ("onselectionchange" in document ? SelectionChangePoller : TimeoutPoller)(reader)
 }
 
-function selectionToDOM(view, takeFocus) {
+export function selectionToDOM(view, takeFocus) {
   let sel = view.state.selection
   syncNodeSelection(view, sel)
 
@@ -202,7 +201,7 @@ function selectionToDOM(view, takeFocus) {
     }
     if (sel.visible) {
       view.dom.classList.remove("ProseMirror-hideselection")
-    } else {
+    } else if (anchor != head) {
       view.dom.classList.add("ProseMirror-hideselection")
       if ("onselectionchange" in document) removeClassOnSelectionChange(view)
     }
@@ -211,7 +210,6 @@ function selectionToDOM(view, takeFocus) {
   reader.storeDOMState(sel)
   reader.ignoreUpdates = false
 }
-exports.selectionToDOM = selectionToDOM
 
 // Kludge to work around Webkit not allowing a selection to start/end
 // between non-editable block nodes. We briefly make something
@@ -232,12 +230,13 @@ function temporarilyEditableNear(view, pos) {
 }
 
 function removeClassOnSelectionChange(view) {
-  document.removeEventListener("selectionchange", view.hideSelectionGuard)
+  let doc = view.dom.ownerDocument
+  doc.removeEventListener("selectionchange", view.hideSelectionGuard)
   let domSel = view.root.getSelection()
   let node = domSel.anchorNode, offset = domSel.anchorOffset
-  document.addEventListener("selectionchange", view.hideSelectionGuard = () => {
+  doc.addEventListener("selectionchange", view.hideSelectionGuard = () => {
     if (domSel.anchorNode != node || domSel.anchorOffset != offset) {
-      document.removeEventListener("selectionchange", view.hideSelectionGuard)
+      doc.removeEventListener("selectionchange", view.hideSelectionGuard)
       view.dom.classList.remove("ProseMirror-hideselection")
     }
   })
@@ -250,6 +249,15 @@ function selectCursorWrapper(view) {
   range.collapse(false)
   domSel.removeAllRanges()
   domSel.addRange(range)
+  // Kludge to kill 'control selection' in IE11 when selecting an
+  // invisible cursor wrapper, since that would result in those weird
+  // resize handles and a selection that considers the absolutely
+  // positioned wrapper, rather than the root editable node, the
+  // focused element.
+  if (!view.state.selection.visible && browser.ie && browser.ie_version <= 11) {
+    node.disabled = true
+    node.disabled = false
+  }
 }
 
 function syncNodeSelection(view, sel) {
@@ -273,14 +281,21 @@ function clearNodeSelection(view) {
   }
 }
 
-function selectionBetween(view, $anchor, $head, bias) {
+export function selectionBetween(view, $anchor, $head, bias) {
   return view.someProp("createSelectionBetween", f => f(view, $anchor, $head))
     || TextSelection.between($anchor, $head, bias)
 }
-exports.selectionBetween = selectionBetween
 
 function hasFocusAndSelection(view) {
   if (view.editable && view.root.activeElement != view.dom) return false
   let sel = view.root.getSelection()
-  return sel.anchorNode && view.dom.contains(sel.anchorNode.nodeType == 3 ? sel.anchorNode.parentNode : sel.anchorNode)
+  if (!sel.anchorNode) return false
+  try {
+    // Firefox will raise 'permission denied' errors when accessing
+    // properties of `sel.anchorNode` when it's in a generated CSS
+    // element.
+    return view.dom.contains(sel.anchorNode.nodeType == 3 ? sel.anchorNode.parentNode : sel.anchorNode)
+  } catch(_) {
+    return false
+  }
 }

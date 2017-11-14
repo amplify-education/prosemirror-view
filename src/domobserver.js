@@ -1,18 +1,18 @@
-const browser = require("./browser")
-const {DOMChange} = require("./domchange")
-const {domIndex} = require("./dom")
+import browser from "./browser"
+import {DOMChange} from "./domchange"
+import {domIndex} from "./dom"
 
-const observeOptions = {childList: true, characterData: true, attributes: true, subtree: true}
+const observeOptions = {childList: true, characterData: true, attributes: true, subtree: true, characterDataOldValue: true}
 // IE11 has very broken mutation observers, so we also listen to DOMCharacterDataModified
 const useCharData = browser.ie && browser.ie_version <= 11
 
-class DOMObserver {
+export class DOMObserver {
   constructor(view) {
     this.view = view
     this.observer = window.MutationObserver &&
       new window.MutationObserver(mutations => this.registerMutations(mutations))
     if (useCharData)
-      this.onCharData = e => this.registerMutation({target: e.target, type: "characterData"})
+      this.onCharData = e => this.registerMutation({target: e.target, type: "characterData", oldValue: e.prevValue})
   }
 
   start() {
@@ -64,9 +64,13 @@ class DOMObserver {
     } else { // "characterData"
       from = desc.posAtStart
       to = desc.posAtEnd
+      // An event was generated for a text change that didn't change
+      // any text. Mark the dom change to fall back to assuming the
+      // selection was typed over with an identical value if it can't
+      // find another change.
+      if (mut.target.nodeValue == mut.oldValue) DOMChange.start(this.view).typeOver = true
     }
 
     DOMChange.start(this.view).addRange(from, to)
   }
 }
-exports.DOMObserver = DOMObserver

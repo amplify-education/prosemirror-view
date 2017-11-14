@@ -1,52 +1,48 @@
-const {Selection, NodeSelection, TextSelection} = require("prosemirror-state")
+import {Selection, NodeSelection, TextSelection} from "prosemirror-state"
 
-const browser = require("./browser")
-const {captureKeyDown} = require("./capturekeys")
-const {DOMChange} = require("./domchange")
-const {parseFromClipboard, serializeForClipboard} = require("./clipboard")
-const {DOMObserver} = require("./domobserver")
-const {selectionBetween} = require("./selection")
+import browser from "./browser"
+import {captureKeyDown} from "./capturekeys"
+import {DOMChange} from "./domchange"
+import {parseFromClipboard, serializeForClipboard} from "./clipboard"
+import {DOMObserver} from "./domobserver"
+import {selectionBetween} from "./selection"
 
 // A collection of DOM events that occur within the editor, and callback functions
 // to invoke when the event fires.
 const handlers = {}, editHandlers = {}
 
-function initInput(view) {
+export function initInput(view) {
   view.shiftKey = false
   view.mouseDown = null
-  view.dragging = null
   view.inDOMChange = null
   view.domObserver = new DOMObserver(view)
   view.domObserver.start()
 
+  view.eventHandlers = Object.create(null)
   for (let event in handlers) {
     let handler = handlers[event]
-    view.dom.addEventListener(event, event => {
+    view.dom.addEventListener(event, view.eventHandlers[event] = event => {
       if (eventBelongsToView(view, event) && !runCustomHandler(view, event) &&
           (view.editable || !(event.type in editHandlers)))
         handler(view, event)
     })
   }
-  view.extraHandlers = Object.create(null)
   ensureListeners(view)
 }
-exports.initInput = initInput
 
-function destroyInput(view) {
+export function destroyInput(view) {
   view.domObserver.stop()
   if (view.inDOMChange) view.inDOMChange.destroy()
+  for (let type in view.eventHandlers)
+    view.dom.removeEventListener(type, view.eventHandlers[type])
 }
-exports.destroyInput = destroyInput
 
-function ensureListeners(view) {
+export function ensureListeners(view) {
   view.someProp("handleDOMEvents", currentHandlers => {
-    for (let type in currentHandlers) if (!view.extraHandlers[type] && !handlers.hasOwnProperty(type)) {
-      view.extraHandlers[type] = true
-      view.dom.addEventListener(type, event => runCustomHandler(view, event))
-    }
+    for (let type in currentHandlers) if (!view.eventHandlers[type])
+      view.dom.addEventListener(type, view.eventHandlers[type] = event => runCustomHandler(view, event))
   })
 }
-exports.ensureListeners = ensureListeners
 
 function runCustomHandler(view, event) {
   return view.someProp("handleDOMEvents", handlers => {
@@ -65,12 +61,11 @@ function eventBelongsToView(view, event) {
   return true
 }
 
-function dispatchEvent(view, event) {
+export function dispatchEvent(view, event) {
   if (!runCustomHandler(view, event) && handlers[event.type] &&
       (view.editable || !(event.type in editHandlers)))
     handlers[event.type](view, event)
 }
-exports.dispatchEvent = dispatchEvent
 
 editHandlers.keydown = (view, event) => {
   if (event.keyCode == 16) view.shiftKey = true
@@ -255,15 +250,18 @@ class MouseDown {
     }
 
     this.mightDrag = null
+    this.target = flushed ? null : event.target
     if (targetNode.type.spec.draggable && targetNode.type.spec.selectable !== false ||
         view.state.selection instanceof NodeSelection && targetPos == view.state.selection.from)
-      this.mightDrag = {node: targetNode, pos: targetPos}
+      this.mightDrag = {node: targetNode,
+                        pos: targetPos,
+                        addAttr: this.target && !this.target.draggable,
+                        setUneditable: this.target && browser.gecko && !this.target.hasAttribute("contentEditable")}
 
-    this.target = flushed ? null : event.target
-    if (this.target && this.mightDrag) {
+    if (this.target && this.mightDrag && (this.mightDrag.addAttr || this.mightDrag.setUneditable)) {
       this.view.domObserver.stop()
-      this.target.draggable = true
-      if (browser.gecko && (this.setContentEditable = !this.target.hasAttribute("contentEditable")))
+      if (this.mightDrag.addAttr) this.target.draggable = true
+      if (this.mightDrag.setUneditable)
         setTimeout(() => this.target.setAttribute("contentEditable", "false"), 20)
       this.view.domObserver.start()
     }
@@ -278,9 +276,8 @@ class MouseDown {
     this.view.root.removeEventListener("mousemove", this.move)
     if (this.mightDrag && this.target) {
       this.view.domObserver.stop()
-      this.target.draggable = false
-      if (browser.gecko && this.setContentEditable)
-        this.target.removeAttribute("contentEditable")
+      if (this.mightDrag.addAttr) this.target.draggable = false
+      if (this.mightDrag.setUneditable) this.target.removeAttribute("contentEditable")
       this.view.domObserver.start()
     }
   }
@@ -316,12 +313,7 @@ handlers.touchdown = view => {
   view.selectionReader.poll("pointer")
 }
 
-handlers.contextmenu = (view, e) => {
-  forceDOMFlush(view)
-  let pos = view.posAtCoords(eventCoords(e))
-  if (pos && view.someProp("handleContextMenu", f => f(view, pos.pos, e)))
-    e.preventDefault()
-}
+handlers.contextmenu = view => forceDOMFlush(view)
 
 // Input compositions are hard. Mostly because the events fired by
 // browsers are A) very unpredictable and inconsistent, and B) not
@@ -354,20 +346,28 @@ editHandlers.compositionend = (view, e) => {
   view.inDOMChange.compositionEnd()
 }
 
-editHandlers.input = view => DOMChange.start(view)
+editHandlers.input = view => {
+  let change = DOMChange.start(view)
+  if (!change.composing) change.finish()
+}
 
 function captureCopy(view, dom) {
   // The extra wrapper is somehow necessary on IE/Edge to prevent the
   // content from being mangled when it is put onto the clipboard
-  let wrap = document.body.appendChild(document.createElement("div"))
+  let doc = dom.ownerDocument
+  let wrap = doc.body.appendChild(doc.createElement("div"))
   wrap.appendChild(dom)
   wrap.style.cssText = "position: fixed; left: -10000px; top: 10px"
-  let sel = getSelection(), range = document.createRange()
+  let sel = getSelection(), range = doc.createRange()
   range.selectNodeContents(dom)
+  // Done because IE will fire a selectionchange moving the selection
+  // to its start when removeAllRanges is called and the editor still
+  // has focus (which will mess up the editor's selection state).
+  view.dom.blur()
   sel.removeAllRanges()
   sel.addRange(range)
   setTimeout(() => {
-    document.body.removeChild(wrap)
+    doc.body.removeChild(wrap)
     view.focus()
   }, 50)
 }
@@ -375,9 +375,9 @@ function captureCopy(view, dom) {
 // This is very crude, but unfortunately both these browsers _pretend_
 // that they have a clipboard API—all the objects and methods are
 // there, they just don't work, and they are hard to test.
-// FIXME when Edge/Mobile Safari fixes this, change this to a version
+// FIXME when Mobile Safari fixes this, change this to a version
 // range test
-const brokenClipboardAPI = browser.ie || browser.ios
+const brokenClipboardAPI = (browser.ie && browser.ie_version < 15) || browser.ios
 
 handlers.copy = editHandlers.cut = (view, e) => {
   let sel = view.state.selection, cut = e.type == "cut"
@@ -385,12 +385,12 @@ handlers.copy = editHandlers.cut = (view, e) => {
 
   // IE and Edge's clipboard interface is completely broken
   let data = brokenClipboardAPI ? null : e.clipboardData
-  let slice = sel.content(), dom = serializeForClipboard(view, slice)
+  let slice = sel.content(), {dom, text} = serializeForClipboard(view, slice)
   if (data) {
     e.preventDefault()
     data.clearData()
     data.setData("text/html", dom.innerHTML)
-    data.setData("text/plain", slice.content.textBetween(0, slice.content.size, "\n\n"))
+    data.setData("text/plain", text)
   } else {
     captureCopy(view, dom)
   }
@@ -402,14 +402,15 @@ function sliceSingleNode(slice) {
 }
 
 function capturePaste(view, e) {
+  let doc = view.dom.ownerDocument
   let plainText = view.shiftKey || view.state.selection.$from.parent.type.spec.code
-  let target = document.body.appendChild(document.createElement(plainText ? "textarea" : "div"))
+  let target = doc.body.appendChild(doc.createElement(plainText ? "textarea" : "div"))
   if (!plainText) target.contentEditable = "true"
   target.style.cssText = "position: fixed; left: -10000px; top: 10px"
   target.focus()
   setTimeout(() => {
     view.focus()
-    document.body.removeChild(target)
+    doc.body.removeChild(target)
     if (plainText) doPaste(view, target.value, null, e)
     else doPaste(view, target.textContent, target.innerHTML, e)
   }, 50)
@@ -422,8 +423,8 @@ function doPaste(view, text, html, e) {
   if (view.someProp("handlePaste", f => f(view, e, slice))) return true
 
   let singleNode = sliceSingleNode(slice)
-  let tr = singleNode ? view.state.tr.replaceSelectionWith(singleNode) : view.state.tr.replaceSelection(slice)
-  view.dispatch(tr.scrollIntoView())
+  let tr = singleNode ? view.state.tr.replaceSelectionWith(singleNode, view.shiftKey) : view.state.tr.replaceSelection(slice)
+  view.dispatch(tr.scrollIntoView().setMeta("paste", true))
   return true
 }
 
@@ -455,6 +456,8 @@ function dropPos(slice, $pos) {
   return $pos.pos
 }
 
+const dragCopyModifier = browser.mac ? "altKey" : "ctrlKey"
+
 handlers.dragstart = (view, e) => {
   let mouseDown = view.mouseDown
   if (mouseDown) mouseDown.done()
@@ -466,14 +469,16 @@ handlers.dragstart = (view, e) => {
     // In selection
   } else if (mouseDown && mouseDown.mightDrag) {
     view.dispatch(view.state.tr.setSelection(NodeSelection.create(view.state.doc, mouseDown.mightDrag.pos)))
-  } else {
-    return
+  } else if (e.target && e.target.nodeType == 1) {
+    let desc = view.docView.nearestDesc(e.target, true)
+    if (!desc || !desc.node.type.spec.draggable || desc == view.docView) return
+    view.dispatch(view.state.tr.setSelection(NodeSelection.create(view.state.doc, desc.posBefore)))
   }
-  let slice = view.state.selection.content(), dom = serializeForClipboard(view, slice)
+  let slice = view.state.selection.content(), {dom, text} = serializeForClipboard(view, slice)
   e.dataTransfer.clearData()
-  e.dataTransfer.setData("text/html", dom.innerHTML)
-  e.dataTransfer.setData("text/plain", slice.content.textBetween(0, slice.content.size, "\n\n"))
-  view.dragging = new Dragging(slice, !e.ctrlKey)
+  e.dataTransfer.setData(brokenClipboardAPI ? "Text" : "text/html", dom.innerHTML)
+  if (!brokenClipboardAPI) e.dataTransfer.setData("text/plain", text)
+  view.dragging = new Dragging(slice, !e[dragCopyModifier])
 }
 
 handlers.dragend = view => {
@@ -491,7 +496,8 @@ editHandlers.drop = (view, e) => {
   let $mouse = view.state.doc.resolve(view.posAtCoords(eventCoords(e)).pos)
   if (!$mouse) return
   let slice = dragging && dragging.slice ||
-      parseFromClipboard(view, e.dataTransfer.getData("text/plain"), e.dataTransfer.getData("text/html"), false, $mouse)
+      parseFromClipboard(view, e.dataTransfer.getData(brokenClipboardAPI ? "Text" : "text/plain"),
+                         brokenClipboardAPI ? null : e.dataTransfer.getData("text/html"), false, $mouse)
   if (!slice) return
 
   e.preventDefault()
@@ -517,20 +523,18 @@ editHandlers.drop = (view, e) => {
   view.dispatch(tr)
 }
 
-handlers.focus = (view, event) => {
+handlers.focus = view => {
   if (!view.focused) {
     view.dom.classList.add("ProseMirror-focused")
     view.focused = true
   }
-  view.someProp("onFocus", f => { f(view, event) })
 }
 
-handlers.blur = (view, event) => {
+handlers.blur = view => {
   if (view.focused) {
     view.dom.classList.remove("ProseMirror-focused")
     view.focused = false
   }
-  view.someProp("onBlur", f => { f(view, event) })
 }
 
 // Make sure all handlers get registered

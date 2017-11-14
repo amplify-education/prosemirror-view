@@ -5,19 +5,10 @@ function compareObjs(a, b) {
   return true
 }
 
-let warnedAboutAssociative = false
-
 class WidgetType {
   constructor(widget, spec) {
     this.spec = spec || noSpec
     this.side = this.spec.side || 0
-    if (this.spec.associative == "left" && this.spec.side == null) {
-      if (!warnedAboutAssociative && typeof console != "undefined" && console.warn) {
-        warnedAboutAssociative = true
-        console.warn("Widget decoration associativity should now be expressed with the `side` option.")
-      }
-      this.side = -1
-    }
 
     if (!this.spec.raw) {
       if (widget.nodeType != 1) {
@@ -94,13 +85,17 @@ class NodeType {
   }
 }
 
-// ::- Decorations can be provided to the view (through the
-// [`decorations` prop](#view.EditorProps.decorations)) to adjust the
-// way the document is drawn. They come in several variants. See the
-// static members of this class for details.
-class Decoration {
+// ::- Decoration objects can be provided to the view through the
+// [`decorations` prop](#view.EditorProps.decorations). They come in
+// several variants—see the static members of this class for details.
+export class Decoration {
   constructor(from, to, type) {
+    // :: number
+    // The start position of the decoration.
     this.from = from
+    // :: number
+    // The end position. Will be the same as `from` for [widget
+    // decorations](#view.Decoration^widget).
     this.to = to
     this.type = type
   }
@@ -185,7 +180,6 @@ class Decoration {
   // if you've stored extra information in that object.
   get spec() { return this.type.spec }
 }
-exports.Decoration = Decoration
 
 // DecorationAttrs:: interface
 // A set of attributes to add to a decorated node. Most properties
@@ -209,7 +203,7 @@ const none = [], noSpec = {}
 // such a way that the drawing algorithm can efficiently use and
 // compare them. This is a persistent data structure—it is not
 // modified, updates create a new value.
-class DecorationSet {
+export class DecorationSet {
   constructor(local, children) {
     this.local = local && local.length ? local : none
     this.children = children && children.length ? children : none
@@ -222,27 +216,29 @@ class DecorationSet {
     return decorations.length ? buildTree(decorations, doc, 0, noSpec) : empty
   }
 
-  // :: (?number, ?number) → [Decoration]
+  // :: (?number, ?number, ?(spec: Object) → bool) → [Decoration]
   // Find all decorations in this set which touch the given range
   // (including decorations that start or end directly at the
-  // boundaries). When the arguments are omitted, all decorations in
-  // the set are collected.
-  find(start, end) {
+  // boundaries) and match the given predicate on their spec. When
+  // `start` and `end` are omitted, all decorations in the set are
+  // considered. When `predicate` isn't given, all decorations are
+  // asssumed to match.
+  find(start, end, predicate) {
     let result = []
-    this.findInner(start == null ? 0 : start, end == null ? 1e9 : end, result, 0)
+    this.findInner(start == null ? 0 : start, end == null ? 1e9 : end, result, 0, predicate)
     return result
   }
 
-  findInner(start, end, result, offset) {
+  findInner(start, end, result, offset, predicate) {
     for (let i = 0; i < this.local.length; i++) {
       let span = this.local[i]
-      if (span.from <= end && span.to >= start)
+      if (span.from <= end && span.to >= start && (!predicate || predicate(span.spec)))
         result.push(span.copy(span.from + offset, span.to + offset))
     }
     for (let i = 0; i < this.children.length; i += 3) {
       if (this.children[i] < end && this.children[i + 1] > start) {
         let childOff = this.children[i] + 1
-        this.children[i + 2].findInner(start - childOff, end - childOff, result, offset + childOff)
+        this.children[i + 2].findInner(start - childOff, end - childOff, result, offset + childOff, predicate)
       }
     }
   }
@@ -362,7 +358,7 @@ class DecorationSet {
       }
     }
     if (local) {
-      let localSet = new DecorationSet(local)
+      let localSet = new DecorationSet(local.sort(byPos))
       return child ? new DecorationGroup([localSet, child]) : localSet
     }
     return child || empty
@@ -397,13 +393,14 @@ class DecorationSet {
     return result
   }
 }
-exports.DecorationSet = DecorationSet
 
 const empty = new DecorationSet()
 
 // :: DecorationSet
 // The empty set of decorations.
 DecorationSet.empty = empty
+
+DecorationSet.removeOverlap = removeOverlap
 
 // :- An abstraction that allows the code dealing with decorations to
 // treat multiple DecorationSet objects as if it were a single object
@@ -641,7 +638,6 @@ function removeOverlap(spans) {
   }
   return working
 }
-exports.removeOverlap = removeOverlap
 
 function insertAhead(array, i, deco) {
   while (i < array.length && byPos(deco, array[i]) > 0) i++
@@ -650,7 +646,7 @@ function insertAhead(array, i, deco) {
 
 // : (EditorView) → union<DecorationSet, DecorationGroup>
 // Get the decorations associated with the current props of a view.
-function viewDecorations(view) {
+export function viewDecorations(view) {
   let found = []
   view.someProp("decorations", f => {
     let result = f(view.state)
@@ -660,4 +656,3 @@ function viewDecorations(view) {
     found.push(DecorationSet.create(view.state.doc, [view.cursorWrapper]))
   return DecorationGroup.from(found)
 }
-exports.viewDecorations = viewDecorations

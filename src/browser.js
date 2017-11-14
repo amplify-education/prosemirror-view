@@ -1,4 +1,5 @@
-const result = module.exports = {}
+const result = {}
+export default result
 
 if (typeof navigator != "undefined") {
   const ie_edge = /Edge\/(\d+)/.exec(navigator.userAgent)
@@ -12,4 +13,5 @@ if (typeof navigator != "undefined") {
   result.chrome = !ie && /Chrome\//.test(navigator.userAgent)
   result.ios = !ie && /AppleWebKit/.test(navigator.userAgent) && /Mobile\/\w+/.test(navigator.userAgent)
   result.webkit = !ie && 'WebkitAppearance' in document.documentElement.style
+  result.safari = /Apple Computer/.test(navigator.vendor)
 }

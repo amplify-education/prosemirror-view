@@ -1,18 +1,20 @@
-const {Fragment, DOMParser} = require("prosemirror-model")
-const {Selection} = require("prosemirror-state")
-const {Mapping} = require("prosemirror-transform")
+import {Fragment, DOMParser} from "prosemirror-model"
+import {Selection, TextSelection} from "prosemirror-state"
+import {Mapping} from "prosemirror-transform"
 
-const {TrackMappings} = require("./trackmappings")
-const {selectionBetween} = require("./selection")
-const {selectionCollapsed} = require("./dom")
+import {TrackMappings} from "./trackmappings"
+import {selectionBetween} from "./selection"
+import {selectionCollapsed} from "./dom"
+import browser from "./browser"
 
-class DOMChange {
+export class DOMChange {
   constructor(view, composing) {
     this.view = view
     this.state = view.state
     this.composing = composing
     this.from = this.to = null
-    this.timeout = composing ? null : setTimeout(() => this.finish(), 20)
+    this.typeOver = false
+    this.timeout = composing ? null : setTimeout(() => this.finish(), DOMChange.commitTimeout)
     this.trackMappings = new TrackMappings(view.state)
 
     // If there have been changes since this DOM update started, we must
@@ -65,7 +67,9 @@ class DOMChange {
     this.markDirty(range)
 
     this.destroy()
-    readDOMChange(this.view, this.mapping, this.state, range)
+    let sel = this.state.selection, allowTypeOver = this.typeOver && sel instanceof TextSelection &&
+        !sel.empty && sel.$head.sameParent(sel.$anchor)
+    readDOMChange(this.view, this.mapping, this.state, range, allowTypeOver)
 
     // If the reading didn't result in a view update, force one by
     // resetting the view to its current state.
@@ -97,7 +101,7 @@ class DOMChange {
     return view.inDOMChange
   }
 }
-exports.DOMChange = DOMChange
+DOMChange.commitTimeout = 20
 
 // Note that all referencing and parsing is done with the
 // start-of-operation selection and document, since that's the one
@@ -118,15 +122,15 @@ function parseBetween(view, oldState, range) {
   let parser = view.someProp("domParser") || DOMParser.fromSchema(view.state.schema)
   let $from = startDoc.resolve(from)
   let sel = null, doc = parser.parse(parent, {
-    topNode: $from.parent.copy(),
-    topStart: $from.index(),
+    topNode: $from.parent,
+    topMatch: $from.parent.contentMatchAt($from.index()),
     topOpen: true,
     from: fromOffset,
     to: toOffset,
     preserveWhitespace: $from.parent.type.spec.code ? "full" : true,
     editableContent: true,
     findPositions: find,
-    ruleFromNode,
+    ruleFromNode: ruleFromNode(parser, $from),
     context: $from
   })
   if (find && find[0].pos != null) {
@@ -137,10 +141,19 @@ function parseBetween(view, oldState, range) {
   return {doc, sel, from, to}
 }
 
-function ruleFromNode(dom) {
-  let desc = dom.pmViewDesc
-  if (desc) return desc.parseRule()
-  else if (dom.nodeName == "BR" && dom.parentNode && dom.parentNode.lastChild == dom) return {ignore: true}
+function ruleFromNode(parser, context) {
+  return dom => {
+    let desc = dom.pmViewDesc
+    if (desc) {
+      return desc.parseRule()
+    } else if (dom.nodeName == "BR" && dom.parentNode) {
+      // Safari replaces the list item with a BR directly in the list node (?!) if you delete the last character in a list item (#708)
+      if (browser.safari && /^(ul|ol)$/i.test(dom.parentNode.nodeName))
+        return parser.matchTag(document.createElement("li"), context)
+      else if (dom.parentNode.lastChild == dom)
+        return {ignore: true}
+    }
+  }
 }
 
 function isAtEnd($pos, depth) {
@@ -194,14 +207,17 @@ function keyEvent(keyCode, key) {
   return event
 }
 
-function readDOMChange(view, mapping, oldState, range) {
+function readDOMChange(view, mapping, oldState, range, allowTypeOver) {
   let parse = parseBetween(view, oldState, range)
 
   let doc = oldState.doc, compare = doc.slice(parse.from, parse.to)
   let change = findDiff(compare.content, parse.doc.content, parse.from, oldState.selection.from)
 
   if (!change) {
-    if (parse.sel) {
+    if (allowTypeOver) {
+      let state = view.state, sel = state.selection
+      view.dispatch(state.tr.replaceSelectionWith(state.schema.text(state.doc.textBetween(sel.from, sel.to)), true).scrollIntoView())
+    } else if (parse.sel) {
       let sel = resolveSelection(view, view.state.doc, mapping, parse.sel)
       if (sel && !sel.eq(view.state.selection)) view.dispatch(view.state.tr.setSelection(sel))
     }
@@ -230,8 +246,7 @@ function readDOMChange(view, mapping, oldState, range) {
   if ($from.sameParent($to) && $from.parent.inlineContent) {
     if ($from.pos == $to.pos) { // Deletion
       tr = view.state.tr.delete(from, to)
-      let $start = doc.resolve(change.start)
-      if ($start.parentOffset < $start.parent.content.size) storedMarks = $start.marks(true)
+      storedMarks = doc.resolve(change.start).marksAcross(doc.resolve(change.endA))
     } else if ( // Adding or removing a mark
       change.endA == change.endB && ($from1 = doc.resolve(change.start)) &&
       (markChange = isMarkChange($from.parent.content.cut($from.parentOffset, $to.parentOffset),

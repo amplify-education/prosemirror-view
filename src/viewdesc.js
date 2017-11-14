@@ -1,16 +1,18 @@
-const {DOMSerializer, Fragment} = require("prosemirror-model")
+import {DOMSerializer, Fragment} from "prosemirror-model"
 
-const {domIndex, isEquivalentPosition} = require("./dom")
-const browser = require("./browser")
+import {domIndex, isEquivalentPosition} from "./dom"
+import browser from "./browser"
 
 // NodeView:: interface
 //
 // By default, document nodes are rendered using the result of the
-// [`toDOM`](#view.NodeSpec.toDOM) method of their spec, and managed
+// [`toDOM`](#model.NodeSpec.toDOM) method of their spec, and managed
 // entirely by the editor. For some use cases, such as embedded
-// node-specific editing interfaces, when you need more control over
-// the behavior of a node's in-editor representation, and can
+// node-specific editing interfaces, you want more control over
+// the behavior of a node's in-editor representation, and need to
 // [define](#view.EditorProps.nodeViews) a custom node view.
+//
+// Objects returned as node views must conform to this interface.
 //
 //   dom:: ?dom.Node
 //   The outer DOM node that represents the document node. When not
@@ -40,17 +42,19 @@ const browser = require("./browser")
 //
 //   deselectNode:: ?()
 //   When defining a `selectNode` method, you should also provide a
-//   `deselectNode` method to disable it again.
+//   `deselectNode` method to remove the effect again.
 //
 //   setSelection:: ?(anchor: number, head: number, root: dom.Document)
 //   This will be called to handle setting the selection inside the
-//   node. By default, a DOM selection will be created between the DOM
-//   positions corresponding to the given anchor and head positions,
-//   but if you override it you can do something else.
+//   node. The `anchor` and `head` positions are relative to the start
+//   of the node. By default, a DOM selection will be created between
+//   the DOM positions corresponding to those positions, but if you
+//   override it you can do something else.
 //
 //   stopEvent:: ?(event: dom.Event) → bool
 //   Can be used to prevent the editor view from trying to handle some
-//   or all DOM events that bubble up from the node view.
+//   or all DOM events that bubble up from the node view. Events for
+//   which this returns true are not handled by the editor.
 //
 //   ignoreMutation:: ?(dom.MutationRecord) → bool
 //   Called when a DOM
@@ -61,7 +65,7 @@ const browser = require("./browser")
 //
 //   destroy:: ?()
 //   Called when the node view is removed from the editor or the whole
-//   editor is detached.
+//   editor is destroyed.
 
 // View descriptions are data structures that describe the DOM that is
 // used to represent the editor's content. They are used for:
@@ -456,10 +460,10 @@ class MarkViewDesc extends ViewDesc {
     this.mark = mark
   }
 
-  static create(parent, mark, view) {
+  static create(parent, mark, inline, view) {
     let custom = customNodeViews(view)[mark.type.name]
     let spec = custom && custom(mark, view)
-    let dom = spec && spec.dom || DOMSerializer.renderSpec(document, mark.type.spec.toDOM(mark)).dom
+    let dom = spec && spec.dom || DOMSerializer.renderSpec(document, mark.type.spec.toDOM(mark, inline)).dom
     return new MarkViewDesc(parent, mark, dom)
   }
 
@@ -517,7 +521,10 @@ class NodeViewDesc extends ViewDesc {
     } else if (!dom) {
       ;({dom, contentDOM} = DOMSerializer.renderSpec(document, node.type.spec.toDOM(node)))
     }
-    if (!contentDOM && !node.isText) dom.contentEditable = false
+    if (!contentDOM && !node.isText) {
+      dom.contentEditable = false
+      if (node.type.spec.draggable) dom.draggable = true
+    }
 
     let nodeDOM = dom
     dom = applyOuterDeco(dom, outerDeco, node)
@@ -555,26 +562,26 @@ class NodeViewDesc extends ViewDesc {
   // separate step, syncs the DOM inside `this.contentDOM` to
   // `this.children`.
   updateChildren(view) {
-    let updater = new ViewTreeUpdater(this)
+    let updater = new ViewTreeUpdater(this), inline = this.node.inlineContent
     iterDeco(this.node, this.innerDeco, widget => {
       if (widget.spec.isCursorWrapper)
-        updater.syncToMarks(widget.spec.marks, view)
+        updater.syncToMarks(widget.spec.marks, inline, view)
       // If the next node is a desc matching this widget, reuse it,
       // otherwise insert the widget as a new view desc.
       updater.placeWidget(widget)
     }, (child, outerDeco, innerDeco, i) => {
       // Make sure the wrapping mark descs match the node's marks.
-      updater.syncToMarks(child.marks, view)
+      updater.syncToMarks(child.marks, inline, view)
       // Either find an existing desc that exactly matches this node,
       // and drop the descs before it.
-      updater.findNodeMatch(child, outerDeco, innerDeco) ||
+      updater.findNodeMatch(child, outerDeco, innerDeco, i) ||
         // Or try updating the next desc to reflect this node.
-        updater.updateNextNode(child, outerDeco, innerDeco, view, this.node.content, i) ||
+        updater.updateNextNode(child, outerDeco, innerDeco, view, i) ||
         // Or just add it as a new desc.
         updater.addNode(child, outerDeco, innerDeco, view)
     })
     // Drop all remaining descs after the current position.
-    updater.syncToMarks(nothing, view)
+    updater.syncToMarks(nothing, inline, view)
     if (this.node.isTextblock) updater.addTextblockHacks()
     updater.destroyRest()
 
@@ -632,11 +639,10 @@ class NodeViewDesc extends ViewDesc {
 
 // Create a view desc for the top-level document node, to be exported
 // and used by the view class.
-function docViewDesc(doc, outerDeco, innerDeco, dom, view) {
+export function docViewDesc(doc, outerDeco, innerDeco, dom, view) {
   applyOuterDeco(dom, outerDeco, doc, true)
   return new NodeViewDesc(null, doc, outerDeco, innerDeco, dom, dom, dom, view)
 }
-exports.docViewDesc = docViewDesc
 
 class TextViewDesc extends NodeViewDesc {
   constructor(parent, node, outerDeco, innerDeco, dom, nodeDOM, view) {
@@ -832,10 +838,13 @@ function patchAttributes(dom, prev, cur) {
       dom.classList.add(curList[i])
   }
   if (prev.style != cur.style) {
-    let text = dom.style.cssText, found
-    if (prev.style && (found = text.indexOf(prev.style)) > -1)
-      text = text.slice(0, found) + text.slice(found + prev.style.length)
-    dom.style.cssText = text + (cur.style || "")
+    if (prev.style) {
+      let prop = /\s*([\w\-\xa1-\uffff]+)\s*:(?:"(?:\\.|[^"])*"|'(?:\\.|[^'])*'|\(.*?\)|[^;])*/g, m
+      while (m = prop.exec(prev.style))
+        dom.style[m[1].toLowerCase()] = ""
+    }
+    if (cur.style)
+      dom.style.cssText += cur.style
   }
 }
 
@@ -871,6 +880,8 @@ class ViewTreeUpdater {
     this.stack = []
     // Tracks whether anything was changed
     this.changed = false
+
+    this.preMatched = preMatch(top.node.content, top.children)
   }
 
   // Destroy and remove the children between the given indices in
@@ -890,7 +901,7 @@ class ViewTreeUpdater {
   // : ([Mark], EditorView)
   // Sync the current stack of mark descs with the given array of
   // marks, reusing existing mark descs when possible.
-  syncToMarks(marks, view) {
+  syncToMarks(marks, inline, view) {
     let keep = 0, depth = this.stack.length >> 1
     let maxKeep = Math.min(depth, marks.length), next
     while (keep < maxKeep &&
@@ -910,7 +921,7 @@ class ViewTreeUpdater {
           (next = this.top.children[this.index]).matchesMark(marks[depth])) {
         this.top = next
       } else {
-        let markDesc = MarkViewDesc.create(this.top, marks[depth], view)
+        let markDesc = MarkViewDesc.create(this.top, marks[depth], inline, view)
         this.top.children.splice(this.index, 0, markDesc)
         this.top = markDesc
         this.changed = true
@@ -923,9 +934,11 @@ class ViewTreeUpdater {
   // : (Node, [Decoration], DecorationSet) → bool
   // Try to find a node desc matching the given data. Skip over it and
   // return true when successful.
-  findNodeMatch(node, outerDeco, innerDeco) {
+  findNodeMatch(node, outerDeco, innerDeco, index) {
     for (let i = this.index, children = this.top.children, e = Math.min(children.length, i + 5); i < e; i++) {
-      if (children[i].matchesNode(node, outerDeco, innerDeco)) {
+      let child = children[i], preMatched
+      if (child.matchesNode(node, outerDeco, innerDeco) &&
+          ((preMatched = this.preMatched.indexOf(child)) == -1 || preMatched == index)) {
         this.destroyBetween(this.index, i)
         this.index++
         return true
@@ -935,16 +948,14 @@ class ViewTreeUpdater {
   }
 
   // : (Node, [Decoration], DecorationSet, EditorView, Fragment, number) → bool
-  // Try to update the next node, if any, to the given data. First
-  // tries scanning ahead in the siblings fragment to see if the next
-  // node matches any of those, and if so, doesn't touch it, to avoid
-  // overwriting nodes that could still be used.
-  updateNextNode(node, outerDeco, innerDeco, view, siblings, index) {
+  // Try to update the next node, if any, to the given data. Checks
+  // pre-matches to avoid overwriting nodes that could still be used.
+  updateNextNode(node, outerDeco, innerDeco, view, index) {
     if (this.index == this.top.children.length) return false
     let next = this.top.children[this.index]
     if (next instanceof NodeViewDesc) {
-      for (let i = index + 1, e = Math.min(siblings.childCount, i + 5); i < e; i++)
-        if (next.node == siblings.child(i)) return false
+      let preMatch = this.preMatched.indexOf(next)
+      if (preMatch > -1 && preMatch != index) return false
       let nextDOM = next.dom
       if (next.update(node, outerDeco, innerDeco, view)) {
         if (next.dom != nextDOM) this.changed = true
@@ -992,7 +1003,24 @@ class ViewTreeUpdater {
   }
 }
 
-// : (ViewDesc, DecorationSet, (Decoration), (Node, [Decoration], DecorationSet))
+// : (Fragment, [ViewDesc]) → [ViewDesc]
+// Iterate from the end of the fragment and array of descs to find
+// directly matching ones, in order to avoid overeagerly reusing
+// those for other nodes. Returns an array whose positions correspond
+// to node positions in the fragment, and whose elements are either
+// descs matched to the child at that index, or empty.
+function preMatch(frag, descs) {
+  let result = [], end = frag.childCount
+  for (let i = descs.length - 1; end > 0 && i >= 0; i--) {
+    let desc = descs[i], node = desc.node
+    if (!node) continue
+    if (node != frag.child(end - 1)) break
+    result[--end] = desc
+  }
+  return result
+}
+
+// : (ViewDesc, DecorationSet, (Decoration), (Node, [Decoration], DecorationSet, number))
 // This function abstracts iterating over the nodes and decorations in
 // a fragment. Calls `onNode` for each node, with its local and child
 // decorations. Splits text nodes when there is a decoration starting

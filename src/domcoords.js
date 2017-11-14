@@ -1,17 +1,18 @@
-const {textRange, parentNode} = require("./dom")
+import {textRange, parentNode} from "./dom"
 
-function windowRect() {
-  return {left: 0, right: window.innerWidth,
-          top: 0, bottom: window.innerHeight}
+function windowRect(win) {
+  return {left: 0, right: win.innerWidth,
+          top: 0, bottom: win.innerHeight}
 }
 
-function scrollRectIntoView(view, rect) {
+export function scrollRectIntoView(view, rect) {
   let scrollThreshold = view.someProp("scrollThreshold") || 0, scrollMargin = view.someProp("scrollMargin")
+  let doc = view.dom.ownerDocument, win = doc.defaultView
   if (scrollMargin == null) scrollMargin = 5
   for (let parent = view.dom;; parent = parentNode(parent)) {
     if (!parent) break
-    let atBody = parent == document.body
-    let bounding = atBody ? windowRect() : parent.getBoundingClientRect()
+    let atBody = parent == doc.body
+    let bounding = atBody ? windowRect(win) : parent.getBoundingClientRect()
     let moveX = 0, moveY = 0
     if (rect.top < bounding.top + scrollThreshold)
       moveY = -(bounding.top - rect.top + scrollMargin)
@@ -23,7 +24,7 @@ function scrollRectIntoView(view, rect) {
       moveX = rect.right - bounding.right + scrollMargin
     if (moveX || moveY) {
       if (atBody) {
-        window.scrollBy(moveX, moveY)
+        win.scrollBy(moveX, moveY)
       } else {
         if (moveY) parent.scrollTop += moveY
         if (moveX) parent.scrollLeft += moveX
@@ -32,14 +33,14 @@ function scrollRectIntoView(view, rect) {
     if (atBody) break
   }
 }
-exports.scrollRectIntoView = scrollRectIntoView
 
 // Store the scroll position of the editor's parent nodes, along with
 // the top position of an element near the top of the editor, which
 // will be used to make sure the visible viewport remains stable even
 // when the size of the content above changes.
-function storeScrollPos(view) {
+export function storeScrollPos(view) {
   let rect = view.dom.getBoundingClientRect(), startY = Math.max(0, rect.top)
+  let doc = view.dom.ownerDocument
   let refDOM, refTop
   for (let x = (rect.left + rect.right) / 2, y = startY + 1;
        y < Math.min(innerHeight, rect.bottom); y += 5) {
@@ -55,15 +56,14 @@ function storeScrollPos(view) {
   let stack = []
   for (let dom = view.dom; dom; dom = parentNode(dom)) {
     stack.push({dom, top: dom.scrollTop, left: dom.scrollLeft})
-    if (dom == document.body) break
+    if (dom == doc.body) break
   }
   return {refDOM, refTop, stack}
 }
-exports.storeScrollPos = storeScrollPos
 
 // Reset the scroll position of the editor's parent nodes to that what
 // it was before, when storeScrollPos was called.
-function resetScrollPos({refDOM, refTop, stack}) {
+export function resetScrollPos({refDOM, refTop, stack}) {
   let newRefTop = refDOM ? refDOM.getBoundingClientRect().top : 0
   let dTop = newRefTop == 0 ? 0 : newRefTop - refTop
   for (let i = 0; i < stack.length; i++) {
@@ -72,7 +72,6 @@ function resetScrollPos({refDOM, refTop, stack}) {
     if (dom.scrollLeft != left) dom.scrollLeft = left
   }
 }
-exports.resetScrollPos = resetScrollPos
 
 function findOffsetInNode(node, coords) {
   let closest, dxClosest = 2e8, coordsClosest, offset = 0
@@ -125,19 +124,13 @@ function findOffsetInText(node, coords) {
 }
 
 function targetKludge(dom, coords) {
-  if (/^[uo]l$/i.test(dom.nodeName)) {
-    for (let child = dom.firstChild; child; child = child.nextSibling) {
-      if (!child.pmViewDesc || !/^li$/i.test(child.nodeName)) continue
-      let childBox = child.getBoundingClientRect()
-      if (coords.left > childBox.left - 2) break
-      if (childBox.top <= coords.top && childBox.bottom >= coords.top) return child
-    }
-  }
+  let parent = dom.parentNode
+  if (parent && /^li$/i.test(parent.nodeName) && coords.left < dom.getBoundingClientRect().left)
+    return parent
   return dom
 }
 
 function posFromElement(view, elt, coords) {
-  elt = targetKludge(elt, coords)
   if (!view.dom.contains(elt.nodeType != 1 ? elt.parentNode : elt)) return null
 
   let {node, offset} = findOffsetInNode(elt, coords), bias = -1
@@ -160,7 +153,7 @@ function posFromCaret(view, node, offset, coords) {
     if (cur == view.dom) break
     let desc = view.docView.nearestDesc(cur, true)
     if (!desc) return null
-    if (desc.node.isBlock) {
+    if (desc.node.isBlock && desc.parent) {
       let rect = desc.dom.getBoundingClientRect()
       if (rect.left > coords.left || rect.top > coords.top) outside = desc.posBefore
       else if (rect.right < coords.left || rect.bottom < coords.top) outside = desc.posAfter
@@ -172,7 +165,7 @@ function posFromCaret(view, node, offset, coords) {
 }
 
 // Given an x,y position on the editor, get the position in the document.
-function posAtCoords(view, coords) {
+export function posAtCoords(view, coords) {
   let root = view.root, node, offset
   if (root.caretPositionFromPoint) {
     let pos = root.caretPositionFromPoint(coords.left, coords.top)
@@ -185,7 +178,19 @@ function posAtCoords(view, coords) {
 
   let elt = root.elementFromPoint(coords.left, coords.top + 1), pos
   if (!elt) return null
-  if (node) pos = posFromCaret(view, node, offset, coords)
+  elt = targetKludge(elt, coords)
+  if (node) {
+    // Suspiciously specific kludge to work around caret*FromPoint
+    // never returning a position at the end of the document
+    if (node == view.dom && offset == node.childNodes.length - 1 && node.lastChild.nodeType == 1 &&
+        coords.top > node.lastChild.getBoundingClientRect().bottom)
+      pos = view.state.doc.content.size
+    // Ignore positions directly after a BR, since caret*FromPoint
+    // 'round up' positions that would be more accurately places
+    // before the BR node.
+    else if (offset == 0 || node.nodeType != 1 || node.childNodes[offset - 1].nodeName != "BR")
+      pos = posFromCaret(view, node, offset, coords)
+  }
   if (pos == null) {
     pos = posFromElement(view, elt, coords)
     if (pos == null) return null
@@ -194,7 +199,6 @@ function posAtCoords(view, coords) {
   let desc = view.docView.nearestDesc(elt, true)
   return {pos, inside: desc ? desc.posAtStart - desc.border : -1}
 }
-exports.posAtCoords = posAtCoords
 
 function singleRect(object, bias) {
   let rects = object.getClientRects()
@@ -204,7 +208,7 @@ function singleRect(object, bias) {
 // : (EditorView, number) → {left: number, top: number, right: number, bottom: number}
 // Given a position in the document model, get a bounding box of the
 // character at that position, relative to the window.
-function coordsAtPos(view, pos) {
+export function coordsAtPos(view, pos) {
   let {node, offset} = view.docView.domFromPos(pos)
   let side, rect
   if (node.nodeType == 3) {
@@ -234,7 +238,6 @@ function coordsAtPos(view, pos) {
   let x = rect[side]
   return {top: rect.top, bottom: rect.bottom, left: x, right: x}
 }
-exports.coordsAtPos = coordsAtPos
 
 function withFlushedState(view, state, f) {
   let viewState = view.state, active = view.root.activeElement
@@ -265,7 +268,7 @@ function endOfTextblockVertical(view, state, dir) {
       else continue
       for (let i = 0; i < boxes.length; i++) {
         let box = boxes[i]
-        if (dir == "up" ? box.bottom < coords.top + 1 : box.top > coords.bottom - 1)
+        if (box.bottom > box.top && (dir == "up" ? box.bottom < coords.top + 1 : box.top > coords.bottom - 1))
           return false
       }
     }
@@ -304,11 +307,10 @@ function endOfTextblockHorizontal(view, state, dir) {
 }
 
 let cachedState = null, cachedDir = null, cachedResult = false
-function endOfTextblock(view, state, dir) {
+export function endOfTextblock(view, state, dir) {
   if (cachedState == state && cachedDir == dir) return cachedResult
   cachedState = state; cachedDir = dir
   return cachedResult = dir == "up" || dir == "down"
     ? endOfTextblockVertical(view, state, dir)
     : endOfTextblockHorizontal(view, state, dir)
 }
-exports.endOfTextblock = endOfTextblock

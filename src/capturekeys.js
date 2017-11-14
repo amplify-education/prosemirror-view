@@ -1,6 +1,6 @@
-const {Selection, NodeSelection, TextSelection} = require("prosemirror-state")
-const browser = require("./browser")
-const {domIndex} = require("./dom")
+import {Selection, NodeSelection, TextSelection} from "prosemirror-state"
+import browser from "./browser"
+import {domIndex} from "./dom"
 
 function moveSelectionBlock(state, dir) {
   let {$anchor, $head} = state.selection
@@ -24,8 +24,9 @@ function selectHorizontally(view, dir) {
       if (next && (next instanceof NodeSelection)) return apply(view, next)
       return false
     } else {
-      let $head = sel.$head, node = $head.textOffset ? null : dir < 0 ? $head.nodeBefore : $head.nodeAfter
-      if (node && NodeSelection.isSelectable(node))
+      let $head = sel.$head, node = $head.textOffset ? null : dir < 0 ? $head.nodeBefore : $head.nodeAfter, desc
+      if (node && NodeSelection.isSelectable(node) &&
+          (node.isAtom || (desc = view.docView.descAt($head.pos)) && !desc.contentDOM))
         return apply(view, new NodeSelection(dir < 0 ? view.state.doc.resolve($head.pos - node.nodeSize) : $head))
       return false
     }
@@ -44,7 +45,7 @@ function nodeLen(node) {
 
 function isIgnorable(dom) {
   let desc = dom.pmViewDesc
-  return desc && desc.size == 0
+  return desc && desc.size == 0 && (dom.nextSibling || dom.nodeName != "BR")
 }
 
 // Make sure the cursor isn't directly after one or more ignored
@@ -197,7 +198,7 @@ function getMods(event) {
   return result
 }
 
-function captureKeyDown(view, event) {
+export function captureKeyDown(view, event) {
   let code = event.keyCode, mods = getMods(event)
   if (code == 8 || (browser.mac && code == 72 && mods == "c")) { // Backspace, Ctrl-h on Mac
     return stopNativeHorizontalDelete(view, -1) || skipIgnoredNodesLeft(view)
@@ -210,13 +211,12 @@ function captureKeyDown(view, event) {
   } else if (code == 39) { // Right arrow
     return selectHorizontally(view, 1) || skipIgnoredNodesRight(view)
   } else if (code == 38) { // Up arrow
-    return selectVertically(view, -1)
+    return selectVertically(view, -1) || skipIgnoredNodesLeft(view)
   } else if (code == 40) { // Down arrow
-    return selectVertically(view, 1)
+    return selectVertically(view, 1) || skipIgnoredNodesRight(view)
   } else if (mods == (browser.mac ? "m" : "c") &&
              (code == 66 || code == 73 || code == 89 || code == 90)) { // Mod-[biyz]
     return true
   }
   return false
 }
-exports.captureKeyDown = captureKeyDown
